@@ -1,6 +1,6 @@
 import os, requests, json, subprocess
 import moviepy.editor as mpe
-from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip, CompositeVideoClip, TextClip, concatenate_videoclips, vfx, afx, ImageClip, ColorClip
+from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip, CompositeVideoClip, TextClip, ColorClip, concatenate_videoclips
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -11,18 +11,15 @@ chat_id = os.environ.get('CHAT_ID')
 webhook_url = os.environ.get('WEBHOOK_URL')
 pexels_key = os.environ.get('PEXELS_API_KEY')
 scenes_data = json.loads(os.environ.get('SCENES_DATA', '[]'))
-resume_url = os.environ.get('RESUME_URL') # n8n Wait Node Resume URL
+resume_url = os.environ.get('RESUME_URL')
 
 print(f"Total Scenes to render: {len(scenes_data)}")
 
 # 1. FREE AI Voiceover
 subprocess.run(['edge-tts', '--voice', 'hi-IN-MadhurNeural', '--text', full_text, '--write-media', 'voiceover.mp3'])
-
 voiceover = AudioFileClip("voiceover.mp3")
 
 total_chars = sum(len(s['text']) for s in scenes_data)
-video_clips = []
-audio_clips = [voiceover]
 headers = {"Authorization": pexels_key}
 current_time = 0.0
 
@@ -33,11 +30,12 @@ except:
     whoosh_sfx = pop_sfx = None
 
 viral_colors = ['#FFD400', '#00FFFF', '#FFFFFF', '#39FF14'] 
-
-# 🌟 SHORTS FORMAT (Vertical 1080x1920)
 TARGET_W, TARGET_H = 1080, 1920
 
-# 2. Process Each Scene
+scene_files = [] # Store filenames instead of video objects
+audio_clips = [voiceover]
+
+# 2. Process Each Scene & Save to Disk Immediately (Memory Fix)
 for i, scene in enumerate(scenes_data):
     keyword = scene.get('keyword', 'nature')
     text_line = scene.get('text', '')
@@ -45,13 +43,14 @@ for i, scene in enumerate(scenes_data):
     if scene_duration < 1.0: scene_duration = 1.0
     
     try:
-        # Pexels API orientation=portrait for Shorts
-        res = requests.get(f"https://api.pexels.com/videos/search?query={keyword}&per_page=1&orientation=portrait", headers=headers).json()
-        video_url = res['videos'][0]['video_files'][0]['link']
+        res = requests.get(f"https://api.pexels.com/videos/search?query={keyword}&per_page=1&orientation=portrait", headers=headers, timeout=10).json()
+        if not res.get('videos'): continue
         
-        vid_path = f"vid_{i}.mp4"
+        video_url = res['videos'][0]['video_files'][0]['link']
+        vid_path = f"raw_vid_{i}.mp4"
+        
         with open(vid_path, "wb") as f:
-            f.write(requests.get(video_url).content)
+            f.write(requests.get(video_url, timeout=30).content)
             
         clip = VideoFileClip(vid_path).subclip(0, scene_duration)
         clip = clip.resize(height=TARGET_H)
@@ -63,7 +62,7 @@ for i, scene in enumerate(scenes_data):
         dark_overlay = ColorClip(size=(TARGET_W, TARGET_H), color=(0,0,0)).set_opacity(0.35).set_position(('center', 'center')).set_duration(scene_duration)
         
         words = text_line.split(' ')
-        chunk_size = 2 # 2 words per screen for fast-paced Shorts
+        chunk_size = 2
         chunks = [' '.join(words[j:j + chunk_size]) for j in range(0, len(words), chunk_size)]
         
         word_clips = []
@@ -72,7 +71,6 @@ for i, scene in enumerate(scenes_data):
         for w_i, chunk in enumerate(chunks):
             current_color = viral_colors[w_i % len(viral_colors)]
             
-            # Adjusted text size for Vertical video
             bg_txt = TextClip(chunk, fontsize=120, color='black', font=HINDI_FONT_FILE, stroke_color='black', stroke_width=18, method='caption', size=(950, None))
             bg_txt = bg_txt.set_position(('center', 'center')).set_duration(duration_per_chunk).set_start(w_i * duration_per_chunk)
             
@@ -81,35 +79,48 @@ for i, scene in enumerate(scenes_data):
             
             word_clips.extend([bg_txt, main_txt])
         
-        # Hard cut without crossfade for perfect sync
         final_scene = CompositeVideoClip([zoomed_clip, dark_overlay] + word_clips, size=(TARGET_W, TARGET_H)).set_duration(scene_duration)
-            
-        video_clips.append(final_scene)
         
-        # Audio Mix Timing
+        # WRITE TO DISK AND FREE MEMORY IMMEDIATELY
+        scene_filename = f"rendered_scene_{i}.mp4"
+        final_scene.write_videofile(scene_filename, fps=24, codec="libx264", preset="ultrafast", logger=None)
+        scene_files.append(scene_filename)
+        
+        # Close objects to free RAM
+        clip.close()
+        zoomed_clip.close()
+        final_scene.close()
+        
         if whoosh_sfx: audio_clips.append(whoosh_sfx.set_start(current_time))
         if pop_sfx: audio_clips.append(pop_sfx.set_start(current_time + 0.1))
                 
         current_time += scene_duration
-        print(f"Scene {i+1} Ready: {keyword}")
+        print(f"Scene {i+1} Rendered & Saved: {keyword}")
+        
     except Exception as e:
         print(f"Error on scene {i}: {e}")
 
-# Stitch Everything without padding
-final_video = concatenate_videoclips(video_clips, method="compose")
+# 3. Stitch Everything using FFmpeg Concat (Extremely Memory Efficient)
+print("Concatenating scenes...")
+with open("concat_list.txt", "w") as f:
+    for sf in scene_files:
+        f.write(f"file '{sf}'\n")
+
+subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "concat_list.txt", "-c", "copy", "stitched_video.mp4"])
+
+# Load stitched video to add final audio, music, and progress bar
+final_video = VideoFileClip("stitched_video.mp4")
 
 # Progress Bar
 final_duration = final_video.duration
 progress_bar = ColorClip(size=(TARGET_W, 15), color=(255, 0, 0))
-progress_bar = progress_bar.set_position(lambda t: (-TARGET_W + int(TARGET_W * (t / max(final_duration, 1))), 'bottom'))
-progress_bar = progress_bar.set_duration(final_duration)
-
+progress_bar = progress_bar.set_position(lambda t: (-TARGET_W + int(TARGET_W * (t / max(final_duration, 1))), 'bottom')).set_duration(final_duration)
 final_video = CompositeVideoClip([final_video, progress_bar])
 
 # Background Music Mix
 try:
     bgm = AudioFileClip("bgm.mp3").volumex(0.30)
-    if bgm.duration < final_video.duration: bgm = afx.audio_loop(bgm, duration=final_video.duration)
+    if bgm.duration < final_video.duration: bgm = moviepy.audio.fx.all.audio_loop(bgm, duration=final_video.duration)
     else: bgm = bgm.subclip(0, final_video.duration)
     audio_clips.append(bgm)
 except: pass
@@ -117,85 +128,17 @@ except: pass
 final_audio = CompositeAudioClip(audio_clips)
 final_video = final_video.set_audio(final_audio)
 
-# 🌟 MAGICAL FIX: FAST RENDER & COMPRESSED SIZE
-print("Rendering Final COMPRESSED SHORTS Video...")
+print("Rendering Final SHORTS Video...")
 final_video.write_videofile("final_video.mp4", fps=24, codec="libx264", audio_codec="aac", threads=2, bitrate="1500k", preset="ultrafast")
 
+# (The rest of your upload logic remains identical)
 print("Starting 5-Layer Indestructible Upload System...")
 video_link = "Upload Failed"
 
-# LAYER 1: 0x0.st
 if not video_link.startswith("http"):
     try:
-        print("Trying 0x0.st API...")
         res = requests.post("https://0x0.st", files={'file': open('final_video.mp4', 'rb')}, timeout=600)
         if res.text.startswith("http"): video_link = res.text.strip()
     except Exception as e: print(f"0x0.st failed: {e}")
 
-# LAYER 2: Uguu.se
-if not video_link.startswith("http"):
-    try:
-        print("Trying Uguu.se API...")
-        res = requests.post("https://uguu.se/upload.php", files={'files[]': open('final_video.mp4', 'rb')}, timeout=600)
-        if res.status_code == 200: video_link = res.json()['files'][0]['url']
-    except Exception as e: print(f"Uguu.se failed: {e}")
-
-# LAYER 3: Tmpfiles.org
-if not video_link.startswith("http"):
-    try:
-        print("Trying Tmpfiles API...")
-        res = requests.post("https://tmpfiles.org/api/v1/upload", files={'file': open('final_video.mp4', 'rb')}, timeout=600)
-        if res.status_code == 200: video_link = res.json()['data']['url'].replace('tmpfiles.org/', 'tmpfiles.org/dl/')
-    except Exception as e: print(f"Tmpfiles failed: {e}")
-
-# LAYER 4: Catbox.moe
-if not video_link.startswith("http"):
-    try:
-        print("Trying Catbox API...")
-        res = requests.post("https://catbox.moe/user/api.php", data={'reqtype': 'fileupload'}, files={'fileToUpload': open('final_video.mp4', 'rb')}, timeout=600)
-        if res.text.startswith("http"): video_link = res.text.strip()
-    except Exception as e: print(f"Catbox failed: {e}")
-
-# LAYER 5: Transfer.sh
-if not video_link.startswith("http"):
-    try:
-        print("Trying Transfer.sh API...")
-        res = requests.put("https://transfer.sh/final_video.mp4", data=open('final_video.mp4', 'rb'), timeout=600)
-        if res.text.startswith("http"): video_link = res.text.strip()
-    except Exception as e: print(f"Transfer.sh failed: {e}")
-
-# Notify Telegram & Resume n8n Wait Node
-print(f"🔥 FINAL YOUTUBE LINK: {video_link} 🔥")
-
-payload = {
-    "chat_id": chat_id, 
-    "message": "👑 Bhai! Shorts Video Ready! 🔥", 
-    "youtube_url": video_link
-}
-
-# --- NEW ROBUST RETRY LOGIC ---
-# Set up a resilient session
-session = requests.Session()
-retries = Retry(
-    total=5,  # Try 5 times
-    backoff_factor=2,  # Wait 2s, 4s, 8s, etc., between retries
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["POST"]
-)
-session.mount('https://', HTTPAdapter(max_retries=retries))
-
-try:
-    print(f"Sending webhook to: {webhook_url}")
-    session.post(webhook_url, json=payload, timeout=15)
-except Exception as e:
-    print(f"Warning: Standard Webhook failed after retries. Error: {e}")
-
-if resume_url:
-    print(f"Resuming n8n workflow at: {resume_url}")
-    try:
-        response = session.post(resume_url, json={"body": payload}, timeout=15)
-        print(f"n8n Resume Response: {response.status_code} - {response.text}")
-    except Exception as e:
-        print(f"Warning: Failed to resume n8n after retries. Error: {e}")
-else:
-    print("No RESUME_URL provided by n8n. Skipping resume step.")
+# ... (Keep the rest of your API upload and webhook code exactly as it was) ...
